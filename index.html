@@ -385,6 +385,18 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
+  
+  /* yt-dlp status log */
+  #ytdlpLog {
+    font-family: monospace;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-top: 0.5rem;
+    max-height: 100px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
 </style>
 </head>
 <body>
@@ -402,6 +414,7 @@
       📥 Ambil Audio
     </button>
     <div id="statusBox" class="status"></div>
+    <div id="ytdlpLog"></div>
   </div>
 
   <!-- Track Info -->
@@ -474,6 +487,7 @@ let audioBuffer = null;
 let trackMetadata = {};
 let sourceUrl = '';
 let audioContext = null;
+let ytdlpReady = false;
 
 // ===== UI HELPERS =====
 function setStatus(type, message) {
@@ -520,6 +534,12 @@ function selectFormat(el) {
   selectedFormat = el.dataset.format;
 }
 
+function logYtDLP(message) {
+  const logEl = document.getElementById('ytdlpLog');
+  logEl.textContent += message + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
 // ===== YOUTUBE AUDIO EXTRACTION =====
 async function fetchAudio() {
   const url = document.getElementById('urlInput').value.trim();
@@ -539,35 +559,44 @@ async function fetchAudio() {
   const btn = document.getElementById('fetchBtn');
   btn.disabled = true;
   setStatus('loading', 'Mengambil audio dari YouTube...');
+  document.getElementById('ytdlpLog').textContent = '';
 
   try {
-    // Try multiple methods to get audio URL
-    let audioUrl = null;
+    // Load yt-dlp wasm if not already loaded
+    if (!window.ytdlp || !ytdlpReady) {
+      setStatus('loading', 'Memuat engine yt-dlp...');
+      await loadYTDLPLibrary();
+    }
 
-    // Method 1: Use noembed/oembed to get title first
-    try {
-      const metaResp = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${vid}`);
-      if (metaResp.ok) {
-        const meta = await metaResp.json();
-        if (meta.title) {
-          trackMetadata.title = meta.title;
-          trackMetadata.author = meta.author_name || 'Unknown';
-        }
-      }
-    } catch(e) { /* ignore */ }
+    if (!window.ytdlp) {
+      throw new Error('Gagal memuat engine yt-dlp.');
+    }
 
-    // Method 2: Use ytdl-core-like approach via public APIs
-    // We'll use the innertube API approach or a proxy
-    audioUrl = await getYouTubeAudioUrl(vid);
+    setStatus('loading', 'Menganalisis link YouTube...');
+    
+    // Use yt-dlp to get the best audio URL
+    const result = await window.ytdlp.extract({
+      url: url,
+      options: [
+        '--extractor-retries', '3',
+        '--no-warnings',
+        '--dump-json'
+      ]
+    });
 
-    if (!audioUrl) {
+    if (!result || !result.url) {
       throw new Error('Tidak bisa mengambil audio. Coba link lain.');
     }
+
+    // Get metadata
+    trackMetadata.title = result.title || 'Unknown Track';
+    trackMetadata.author = result.uploader || 'Unknown';
+    trackMetadata.duration = result.duration;
 
     setStatus('loading', 'Mendownload audio...');
 
     // Download as blob
-    const resp = await fetch(audioUrl);
+    const resp = await fetch(result.url);
     if (!resp.ok) throw new Error('Gagal download audio');
 
     const blob = await resp.blob();
@@ -582,7 +611,6 @@ async function fetchAudio() {
     audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
     // Show info
-    trackMetadata.duration = audioBuffer.duration;
     trackMetadata.sampleRate = audioBuffer.sampleRate;
     trackMetadata.channels = audioBuffer.numberOfChannels;
 
@@ -614,82 +642,24 @@ function extractVideoId(url) {
   return null;
 }
 
-async function getYouTubeAudioUrl(videoId) {
-  // Try using a public yt-dlp based API
-  // Option A: Invidious API instances
-  const invidiousInstances = [
-    'https://vid.puffyan.us',
-    'https://invidious.snopyta.org',
-    'https://yewtu.be',
-    'https://inv.nadeko.net',
-  ];
-
-  for (const instance of invidiousInstances) {
-    try {
-      const resp = await fetch(`${instance}/api/v1/videos/${videoId}`);
-      if (resp.ok) {
-        const data = await resp.json();
-        // Get best audio-only stream
-        if (data.adaptiveFormats) {
-          const audioOnly = data.adaptiveFormats.filter(f => f.mimeType && !f.container);
-          if (audioOnly.length > 0) {
-            // Return a direct URL to the audio stream
-            // Note: Invidious streams may have CORS issues
-            const audioFmt = audioOnly.find(f => f.bitrate) || audioOnly[0];
-            return `${instance}${audioFmt.url}`;
-          }
-        }
-      }
-    } catch(e) { continue; }
-  }
-
-  // Fallback: try a different approach with a known working endpoint
-  try {
-    const resp = await fetch(`https://www.youtube.com/youtubei/v1/player`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        videoId: videoId,
-        context: { client: { clientName: "WEB", clientVersion: "2.20240101.00.00" } }
-      })
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.streamingData && data.streamingData.adaptiveFormats) {
-        const audioStreams = data.streamingData.adaptiveFormats.filter(
-          f => f.mimeType && (f.mimeType.includes('webm') || f.mimeType.includes('mp4')) && f.audioBitrate
-        );
-        if (audioStreams.length > 0) {
-          // Pick the one with highest bitrate
-          audioStreams.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0));
-          const best = audioStreams[0];
-          // Decode the url parameter
-          const decoder = new TextDecoder();
-          const decodedUrl = decoder.decode(
-            Uint8Array.from(atob(best.url.replace(/-/g, '+').replace(/_/g, '/')).map(c => c.charCodeAt(0)))
-              .reduce((acc, val) => acc + String.fromCharCode(val), '')
-          );
-          return decodedUrl;
-        }
-      }
-    }
-  } catch(e) { /* ignore */ }
-
-  // Last resort: use a well-known public API
-  try {
-    const resp = await fetch(`https://api.vezzle.com/api/yt/get-video-info?videoId=${videoId}`);
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.streams) {
-        const audioStreams = data.streams.filter(s => s.type === 'audio');
-        if (audioStreams.length > 0) {
-          return audioStreams[0].url;
-        }
-      }
-    }
-  } catch(e) {}
-
-  return null;
+async function loadYTDLPLibrary() {
+  // Load the WebAssembly module from a CDN
+  const script = document.createElement('script');
+  script.src = 'https://unpkg.com/yt-dlp-web-ui@latest/dist/browser/ytdlp.js';
+  script.onload = () => {
+    ytdlpReady = true;
+    logYtDLP('Engine yt-dlp berhasil dimuat.');
+  };
+  script.onerror = () => {
+    logYtDLP('Gagal memuat engine yt-dlp.');
+  };
+  document.head.appendChild(script);
+  
+  // Wait for the script to load
+  await new Promise((resolve) => {
+    script.onload = resolve;
+    script.onerror = () => resolve();
+  });
 }
 
 function showTrackInfo() {
@@ -798,207 +768,4 @@ async function convertAndDownload() {
         resultBlob = await mp3Encode(renderedBuffer);
         break;
       case 'ogg':
-        resultBlob = oggEncode(renderedBuffer);
-        break;
-      case 'flac':
-        resultBlob = flacEncode(renderedBuffer);
-        break;
-    }
-
-    // Download
-    const ext = selectedFormat;
-    const filename = (trackMetadata.title || 'audio')
-      .replace(/[^\w\s\-]/g, '')
-      .replace(/\s+/g, '_')
-      .substring(0, 60);
-
-    triggerDownload(resultBlob, `${filename}.${ext}`);
-
-    setConvertStatus('success', `✅ Selesai! File "${filename}.${ext}" sedang didownload.`);
-    showToast('File berhasil didownload!');
-
-  } catch(err) {
-    console.error(err);
-    setConvertStatus('error', `Konversi gagal: ${err.message}`);
-  } finally {
-    convertBtn.disabled = false;
-  }
-}
-
-function triggerDownload(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-// ===== ENCODERS =====
-
-// WAV Encoder (pure JS)
-function wavEncode(buffer) {
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const format = 1; // PCM
-  const bitsPerSample = 16;
-
-  const length = buffer.length;
-  const bytesPerSample = bitsPerSample / 8;
-  const blockAlign = numChannels * bytesPerSample;
-  const dataSize = length * blockAlign;
-  const headerSize = 44;
-  const totalSize = headerSize + dataSize;
-
-  const arrayBuffer = new ArrayBuffer(totalSize);
-  const view = new DataView(arrayBuffer);
-
-  // RIFF header
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, totalSize - 8, true);
-  writeString(view, 8, 'WAVE');
-
-  // fmt chunk
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true); // chunk size
-  view.setUint16(20, format, true); // PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-
-  // data chunk
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  // Write interleaved samples
-  const channels = [];
-  for (let ch = 0; ch < numChannels; ch++) {
-    channels.push(buffer.getChannelData(ch));
-  }
-
-  let offset = 44;
-  for (let i = 0; i < length; i++) {
-    for (let ch = 0; ch < numChannels; ch++) {
-      let sample = channels[ch][i];
-      sample = Math.max(-1, Math.min(1, sample));
-      const val = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-      view.setInt16(offset, val, true);
-      offset += 2;
-    }
-  }
-
-  return new Blob([arrayBuffer], { type: 'audio/wav' });
-}
-
-function writeString(view, offset, str) {
-  for (let i = 0; i < str.length; i++) {
-    view.setUint8(offset + i, str.charCodeAt(i));
-  }
-}
-
-// MP3 Encoder (using lamejs CDN)
-async function mp3Encode(buffer) {
-  // Load lamejs dynamically
-  if (!window.lamejs) {
-    await loadScript('https://cdn.jsdelivr.net/npm/lamejs@1.2.2/lame.js');
-  }
-
-  const LAME = window.lamejs;
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const bitrate = parseInt(document.getElementById('bitrateSlider').value);
-
-  const mp3encoder = new LAME.Mp3Encoder(numChannels, sampleRate, bitrate);
-  const blockSize = 1152;
-  const leftChannel = buffer.getChannelData(0);
-  const rightChannel = numChannels > 1 ? buffer.getChannelData(1) : leftChannel;
-
-  const mp3Chunks = [];
-
-  for (let i = 0; i < leftChannel.length; i += blockSize) {
-    const leftChunk = leftChannel.subarray(i, i + blockSize);
-    const rightChunk = rightChannel.subarray(i, i + blockSize);
-
-    const leftInt16 = floatTo16BitPCM(leftChunk);
-    const rightInt16 = floatTo16BitPCM(rightChunk);
-
-    const encoded = mp3encoder.encodeBuffer(leftInt16, rightInt16);
-    if (encoded.length > 0) {
-      mp3Chunks.push(encoded);
-    }
-  }
-
-  const finish = mp3encoder.flush();
-  if (finish.length > 0) {
-    mp3Chunks.push(finish);
-  }
-
-  const totalLength = mp3Chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of mp3Chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  return new Blob([merged], { type: 'audio/mpeg' });
-}
-
-function floatTo16BitPCM(float32Array) {
-  const result = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    result[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-  }
-  return result;
-}
-
-// OGG Encoder (using ogaudio CDN)
-function oggEncode(buffer) {
-  // Simple OGG Vorbis encoding using Web Audio and built-in capabilities
-  // Since pure JS OGG encoding is complex, we'll use a simpler approach:
-  // Encode as WAV and wrap, or use a lightweight library
-
-  // For simplicity, we'll just return WAV for now since browsers handle it fine
-  // But let's do a proper attempt with a simple OGG wrapper
-
-  // Actually, let's just use WAV for now since it works everywhere
-  // OGG support in pure JS without external libs is limited
-  return wavEncode(buffer);
-}
-
-// FLAC Encoder (basic)
-function flacEncode(buffer) {
-  // Minimal FLAC implementation
-  // Returns WAV as fallback since pure FLAC is very complex
-  return wavEncode(buffer);
-}
-
-async function loadScript(src) {
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = src;
-    s.onload = resolve;
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
-}
-
-// ===== KEYBOARD SHORTCUTS =====
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && document.activeElement.id === 'urlInput') {
-    fetchAudio();
-  }
-});
-
-// Initial setup
-updateBitrateLabel();
-updateVolumeLabel();
-</script>
-
-</body>
-</html>
+        resultBlob = oggEncode(rendere
